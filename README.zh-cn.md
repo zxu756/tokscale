@@ -119,7 +119,7 @@
 | <img width="48px" src=".github/assets/client-fx.png" alt="Fx" /> | [fx](https://github.com/vercel-labs/fx) | `~/.fx/sessions/<sessionId>/usage-v2.json` (按会话聚合) |
 | <img width="48px" src="https://github.com/meta-models.png" alt="Muse Code" /> | [Muse Code](https://dev.meta.ai/docs/muse-code) | `~/.local/share/muse/sessions/**/session.jsonl`（Windows 通用 XDG 路径，含 `subagent/<uuid>/` 子代理记录） |
 | <img width="48px" src=".github/assets/client-aside.png" alt="Aside" /> | [Aside](https://asidehq.com) | `~/.aside/u/<account>/sessions/<session>/messages.jsonl` |
-| <img width="48px" src="https://github.com/mistralai.png" alt="Mistral Vibe" /> | [Mistral Vibe](https://github.com/mistralai/mistral-vibe) | `~/.vibe/logs/session/<session-dir>/meta.json`（Windows 通用路径；可用 `VIBE_HOME` 覆盖根目录） |
+| <img width="48px" src="https://github.com/mistralai.png" alt="Mistral Vibe" /> | [Mistral Vibe](https://github.com/mistralai/mistral-vibe) | `~/.vibe/logs/session/<session-dir>/meta.json`，Vibe 3.x 为 `~/.vibe/logs/session/unified/<id>/journal/*.jsonl`（Windows 通用路径；可用 `VIBE_HOME` 覆盖根目录） |
 | <img width="48px" src="https://raw.githubusercontent.com/proma-ai/Proma/86d9dfb511db4c1e3ffded3b6c3e312996f50cbf/apps/electron/resources/icon.png" alt="Proma" /> | [Proma](https://github.com/proma-ai/Proma) | `~/.proma/agent-sessions/`, `~/.proma/sdk-config/{sessions,projects}/`; `~/.proma-dev/` |
 | <img width="48px" src="https://github.com/get-bb.png" alt="BB" /> | [BB](https://getbb.app) | `~/.bb/bb.db`, `$BB_DATA_DIR/bb.db`, `~/.bb-dev/*/bb.db` |
 | <img width="48px" src="https://github.com/alibaba.png" alt="Qoder" /> | [Qoder](https://qoder.com) | `~/.qoder/projects/**/*.jsonl`, `~/.qoder-cn/projects/**/*.jsonl`（可用 `QODER_CONFIG_DIR` / `QODERCN_CONFIG_DIR` 覆盖根目录） |
@@ -1589,7 +1589,7 @@ AI 编程工具将会话数据存储在跨平台位置。大多数工具在所�
 | Hindsight | `$HINDSIGHT_HOME/usage/`（回退：`~/.hindsight/usage/`） | `%HINDSIGHT_HOME%\usage\`（回退：`%USERPROFILE%\.hindsight\usage\`） | 通过 `tokscale hindsight sync` 进行 API 同步；Hindsight 本身不保留本地会话日志，数据从 LLM 追踪 API 同步到仅追加的 JSONL 缓存中 |
 | Muse Code | `~/.local/share/muse/sessions/` | `%USERPROFILE%\.local\share\muse\sessions\` | 全平台通用 XDG 路径；解析 `session.jsonl` 的 `model_completed` 用量事件及 `subagent/` 记录 |
 | Aside | `~/.aside/u/<account>/sessions/<session>/messages.jsonl` | `%USERPROFILE%\.aside\u\<account>\sessions\<session>\messages.jsonl` | 按账户读取原生浏览器用量；仅扫描 `messages.jsonl`，排除 artifacts、memory 和 passwords。 |
-| Mistral Vibe | `$VIBE_HOME/logs/session/`（默认：`~/.vibe/logs/session/`） | `%VIBE_HOME%\logs\session\`（默认：`%USERPROFILE%\.vibe\logs\session\`） | 全平台通用 `~/.vibe` 根目录；仅读取各会话目录的 `meta.json` 累计 `stats`，不读取 `messages.jsonl` 对话内容 |
+| Mistral Vibe | `$VIBE_HOME/logs/session/`（默认：`~/.vibe/logs/session/`） | `%VIBE_HOME%\logs\session\`（默认：`%USERPROFILE%\.vibe\logs\session\`） | 全平台通用 `~/.vibe` 根目录；仅读取各会话目录的 `meta.json` 累计 `stats`，不读取 `messages.jsonl` 对话内容。Vibe 3.x：从 `unified/<id>/journal/*.jsonl` 读取逐次调用的 `usage` |
 | Proma | `~/.proma/`, `~/.proma-dev/` | `%USERPROFILE%\.proma\`, `%USERPROFILE%\.proma-dev\` | 优先使用 Pi SDK 用量，避免重复计算界面副本；同时支持旧版 Claude SDK 记录及独立界面日志。详见[统计规则与限制](docs/proma.md)。 |
 | BB | `$BB_DATA_DIR`（默认：`~/.bb/`）、`~/.bb-dev/` | `%BB_DATA_DIR%`（默认：`%USERPROFILE%\.bb\`）、`%USERPROFILE%\.bb-dev\` | 解析 `bb.db` SQLite 数据库（`threads` 和 `events` 表）。准确提取编排代理 Harness 中的 Prompt 缓存和推理 Token 分解。BB 在常规主目录下运行 Claude Code 和 Codex，因此两边都记录的响应只在 `claude` 或 `codex` 下统计一次；仅指定 `--client bb` 时仍显示 BB 记录的全部内容。 |
 | Qoder | `$QODER_CONFIG_DIR/projects/`（默认：`~/.qoder/projects/`）、`$QODERCN_CONFIG_DIR/projects/`（默认：`~/.qoder-cn/projects/`） | `%QODER_CONFIG_DIR%\projects\`（默认：`%USERPROFILE%\.qoder\projects\`）、`%QODERCN_CONFIG_DIR%\projects\`（默认：`%USERPROFILE%\.qoder-cn\projects\`） | 解析 Qoder 和 Qoder CN 的 JSONL 会话及子代理日志；合并多分块助手片段，并在托管模型 Token 数被归零时从对话文本进行估算 |
@@ -2123,6 +2123,8 @@ Muse Spark 模型按上游数据集计价——LiteLLM 和 models.dev 均收录�
 Vibe 为每个会话创建一个目录，存放 `meta.json` 与 `messages.jsonl` 对话记录。用量是会话粒度的：对话记录不含逐条消息的模型、时间戳或 token 数，因此 Tokscale 只读取 `meta.json` 中的累计 `stats` 块（`session_prompt_tokens`、`session_completion_tokens`、`session_cached_tokens`），不读取对话内容。`session_cached_tokens` 是 `session_prompt_tokens` 的*子集*而非额外项，因此计价前会把缓存读取从输入 token 中拆出——与 Vibe 自身的成本显示采用相同算法。所以每个会话一条消息已是该格式能支持的最细粒度：`steps` 作为消息数，`end_time`（ISO-8601，缺失时用 `start_time`）作为时间戳。2.0 之前的会话把相同字段放在 `metadata` 键下，存为扁平的 `<prefix>_*.json` 文件，这种格式仍会被读取。
 
 模型取自 `meta.json` 的 `config.active_model`，即会话固定的别名。从未固定过的会话会记录空字符串——这是 Vibe 文档中「沿用所配置的默认值」的哨兵值——因此 Tokscale 不会把用量归到空模型，而是先从会话自身的 `config.models` 表解析，再退回 Mistral 公布的默认别名。注意别名（`mistral-medium-3.5`）并非实际请求 ID：Vibe 发送的是公开价格数据集中不存在的 CLI 专用端点名（`mistral-vibe-cli-latest`），所以计价按别名匹配。工作区标签来自 `environment.working_directory`，缺失时回退到 `origin_directory`。
+
+Vibe 3.x 换成了统一会话存储（`store_format` 为 `mistral.vibe.unified-session-store/v1`）：`~/.vibe/logs/session/unified/<session-id>/` 下有一个不含 `stats` 的 `meta.json` 和只追加的 `journal/<起始序号>.jsonl`。Tokscale 扫描 journal 分段，并从同目录的 `meta.json` 读取模型、时间、标题和工作区。每次模型调用是一条类型为 `completion_succeeded`（或 `completion_failed`）的 `action_result` 记录，其 `usage` 是这次调用自己的用量；回灌到下一条 `core_input` 记录里的相同副本不计入，在多个分段里重复出现的调用按 `action_id` 去重。每次调用都满足 `total_tokens = input_tokens + output_tokens`，因此 `cached_input_tokens` 从输入中拆出，`reasoning_tokens` 从输出中拆出。Tokscale 只解析这些 `usage` 行，但 journal 本身也保存对话内容，所以会从磁盘读取它。journal 没有逐次调用的时间戳，每次调用都按会话的 `end_time` 记时间。Vibe 压缩长会话时会删除新快照之前的 journal 分段，且没有在别处保存累计 token 数，因此压缩前的用量无法恢复，这类会话报告的是下限。
 
 ## 定价
 

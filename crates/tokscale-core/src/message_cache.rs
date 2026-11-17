@@ -2311,7 +2311,8 @@ fn parser_version(client: ClientId) -> u32 {
         // v2 preserves actual provider identity; v3 clears stale provider
         // metadata when a persisted reset/sentinel snapshot removes it.
         ClientId::Muse => 3,
-        ClientId::Vibe => 1,
+        // v2: reads Vibe 3.x unified-store journal segments.
+        ClientId::Vibe => 2,
         // v1->v2: cumulative total differencing and fork deduplication.
         // v2->v3: dedup keys name the provider session and turn, so a row
         // mirrored from a Claude transcript or Codex rollout can yield to it.
@@ -9340,7 +9341,7 @@ mod tests {
 
     #[test]
     fn test_vibe_parser_version() {
-        assert_eq!(parser_version(ClientId::Vibe), 1);
+        assert_eq!(parser_version(ClientId::Vibe), 2);
     }
 
     #[test]

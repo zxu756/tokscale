@@ -433,3 +433,127 @@ fn test_vibe_scanner_skips_index_and_atomic_write_temporaries() {
         "one real session plus one legacy session"
     );
 }
+
+const UNIFIED_SESSION_ID: &str = "4d8ea0b7-b267-8b9d-4e3b-75cfc2592f0b";
+
+fn completion_result(sequence: i64, action_id: &str, usage: &str) -> String {
+    format!(
+        r#"{{"payload":{{"action_id":"{action_id}","result":{{"action_id":"{action_id}","result":{{"finish_reason":"stop","parts":[{{"text":"done","type":"text"}}],"usage":{usage}}},"type":"completion_succeeded"}},"state":"succeeded"}},"previous_record_sha256":null,"record_sha256":"x","recovery_journal_record_version":1,"sequence":{sequence},"type":"action_result"}}"#
+    )
+}
+
+/// Builds a Vibe 3.x unified-store session the way `vibe` 3.1 writes it.
+fn write_unified_session(home: &Path) -> PathBuf {
+    let session_dir = home
+        .join(".vibe/logs/session/unified")
+        .join(UNIFIED_SESSION_ID);
+    let workspace = home.join("unified-project");
+    fs::create_dir_all(&workspace).unwrap();
+    let root = workspace.to_string_lossy().replace('\\', "/");
+    fs::create_dir_all(session_dir.join("journal")).unwrap();
+    fs::create_dir_all(session_dir.join("generations/0000000000000001")).unwrap();
+    fs::write(
+        session_dir.join("meta.json"),
+        format!(
+            r#"{{"session_id":"{UNIFIED_SESSION_ID}","start_time":"2026-11-15T19:17:06.262000+00:00","end_time":"2026-11-15T19:17:28.557000+00:00","environment":{{"working_directory":"{root}"}},"origin_directory":"{root}","title":"Unified store session","config":{{"active_model":"codestral-latest","model_name":"codestral-latest"}},"runtime_path":"session_api"}}"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        session_dir.join("CURRENT"),
+        format!(
+            r#"{{"generation":"0000000000000001","session_id":"{UNIFIED_SESSION_ID}","snapshot_sequence":1,"store_format":"mistral.vibe.unified-session-store/v1","store_format_minor":10}}"#
+        ),
+    )
+    .unwrap();
+    fs::write(
+        session_dir.join("generations/0000000000000001/checkpoint.json"),
+        r#"{"checkpoint_version":1,"last_reported_context_tokens":20755}"#,
+    )
+    .unwrap();
+
+    let first_usage = r#"{"cache_write_tokens":0,"cached_input_tokens":3456,"input_tokens":14369,"output_tokens":92,"reasoning_tokens":0,"total_tokens":14461}"#;
+    let second_usage = r#"{"cache_write_tokens":0,"cached_input_tokens":6784,"input_tokens":12106,"output_tokens":267,"reasoning_tokens":196,"total_tokens":12373}"#;
+    let first_segment = [
+        r#"{"payload":{"action_id":"call-1","kind":"completion","request":{"model_input":{}}},"sequence":1,"type":"action_intent"}"#.to_string(),
+        completion_result(2, "call-1", first_usage),
+        // The core echoes the same completion back as input; it must not count twice.
+        format!(r#"{{"payload":{{"input":{{"command":{{"result":{{"usage":{first_usage}}}}}}}}},"sequence":3,"type":"core_input"}}"#),
+        r#"{"payload":{"action_id":"tool-1","result":{"result":{"usage":{"input_tokens":1}},"type":"tool_succeeded"}},"sequence":4,"type":"action_result"}"#.to_string(),
+        r#"{"payload":{"action_id":"hook-1","result":{"type":"hook_completed"}},"sequence":5,"type":"action_result"}"#.to_string(),
+    ];
+    fs::write(
+        session_dir.join("journal/0000000000000001.jsonl"),
+        first_segment.join("\n") + "\n",
+    )
+    .unwrap();
+    // A later segment that repeats call-1, adds call-2 and ends mid-write.
+    let second_segment = [
+        completion_result(2, "call-1", first_usage),
+        completion_result(6, "call-2", second_usage),
+        r#"{"payload":{"action_id":"call-3","result":{"result":{"usage":{"input_tok"#.to_string(),
+    ];
+    fs::write(
+        session_dir.join("journal/0000000000000006.jsonl"),
+        second_segment.join("\n"),
+    )
+    .unwrap();
+    session_dir
+}
+
+#[test]
+fn test_vibe_unified_store_counts_each_completion_once() {
+    let home_dir = common::temp_home();
+    let session_dir = write_unified_session(home_dir.path());
+
+    let messages = parse_vibe_file(&session_dir.join("journal/0000000000000001.jsonl"));
+    assert_eq!(
+        messages.len(),
+        1,
+        "tool, hook and core_input rows are not calls"
+    );
+    let call = &messages[0];
+    assert_eq!(call.client, "vibe");
+    assert_eq!(call.session_id, UNIFIED_SESSION_ID);
+    assert_eq!(call.model_id, "codestral-latest");
+    assert_eq!(call.provider_id, "mistralai");
+    assert_eq!(call.tokens.input, 14369 - 3456);
+    assert_eq!(call.tokens.cache_read, 3456);
+    assert_eq!(call.tokens.output, 92);
+    assert_eq!(call.tokens.reasoning, 0);
+    assert_eq!(call.tokens.total(), 14461);
+    assert_eq!(call.session_title.as_deref(), Some("Unified store session"));
+    assert_eq!(call.workspace_label.as_deref(), Some("unified-project"));
+
+    let messages = parse_vibe_file(&session_dir.join("journal/0000000000000006.jsonl"));
+    assert_eq!(messages.len(), 2, "the truncated trailing row is skipped");
+    let reasoning_call = &messages[1];
+    assert_eq!(reasoning_call.tokens.output, 267 - 196);
+    assert_eq!(reasoning_call.tokens.reasoning, 196);
+    assert_eq!(reasoning_call.tokens.total(), 12373);
+
+    // The unified meta.json carries no stats and is not a session on its own.
+    assert!(parse_vibe_file(&session_dir.join("meta.json")).is_empty());
+}
+
+#[tokio::test]
+async fn test_vibe_unified_store_end_to_end_dedups_across_segments() {
+    let home_dir = common::temp_home();
+    let home = home_dir.path();
+    write_unified_session(home);
+
+    let pricing = make_pricing_service();
+    let messages =
+        parse_local_unified_messages_with_pricing_uncached(vibe_options(home), Some(&pricing))
+            .await
+            .unwrap();
+
+    assert_eq!(messages.len(), 2, "call-1 appears in both segments");
+    let total: i64 = messages.iter().map(|m| m.tokens.total()).sum();
+    assert_eq!(total, 14461 + 12373);
+    assert!(messages.iter().all(|m| m.session_id == UNIFIED_SESSION_ID));
+    assert!(messages.iter().all(|m| m.cost > 0.0));
+
+    let parsed = parse_local_clients(vibe_options(home)).unwrap();
+    assert_eq!(parsed.counts.get(ClientId::Vibe), 2);
+}

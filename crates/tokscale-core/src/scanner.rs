@@ -734,9 +734,21 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 // `tmp<random>.json.tmp` / `.session_index.<random>.tmp`. Both
                 // are excluded by leading dot and by suffix rather than by a
                 // `session_` prefix they never carry.
+                //
+                // Vibe 3.x's unified session store keeps usage in
+                // `unified/<id>/journal/*.jsonl` instead; its `meta.json`
+                // carries no `stats`, so the journal segments are the scanned
+                // files and the parser reads `meta.json` beside them.
                 "vibe-session" => {
-                    if file_name == "meta.json" {
+                    let in_unified_session = |dir: Option<&Path>| {
+                        dir.and_then(Path::parent)
+                            .and_then(Path::file_name)
+                            .is_some_and(|name| name == "unified")
+                    };
+                    if crate::sessions::vibe::unified_journal_session_dir(path).is_some() {
                         true
+                    } else if file_name == "meta.json" {
+                        !in_unified_session(path.parent())
                     } else {
                         // Upstream's own migration globs the save directory
                         // non-recursively (`Path(save_dir).glob("<prefix>_*.json")`),
