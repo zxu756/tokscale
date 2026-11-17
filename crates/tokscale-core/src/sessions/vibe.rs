@@ -23,11 +23,28 @@
 //! out instead of summing. Usage is session-granular: a Vibe transcript carries
 //! no per-message model, timestamp, or token counts, so one message per session
 //! is the finest row the format supports.
+//!
+//! Unified session store (Vibe 3.x, `store_format`
+//! `mistral.vibe.unified-session-store/v1` in the session's `CURRENT` file):
+//!   ~/.vibe/logs/session/unified/<session_id>/
+//!     ├── meta.json            (no `stats`; model, times, workspace, title)
+//!     ├── CURRENT
+//!     ├── generations/<seq>/   (snapshots; no token counters)
+//!     └── journal/<first_sequence>.jsonl
+//!
+//! Each journal row is one recovery record. A model call is an `action_result`
+//! record whose `payload.result.type` is `completion_succeeded` (or
+//! `completion_failed`) and whose `payload.result.result.usage` holds that
+//! call's own counts. The same result is echoed into the following
+//! `core_input` record, so only `action_result` rows are counted. See
+//! [`parse_unified_journal`] for the usage semantics and what a compacted
+//! session loses.
 
 use super::utils::{file_modified_timestamp_ms, parse_timestamp_value};
 use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::{provider_identity, TokenBreakdown};
 use serde_json::Value;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 /// Alias of the model Vibe resolves an unpinned session to when the session
@@ -99,7 +116,200 @@ fn resolve_model(meta: &Value) -> String {
     DEFAULT_MODEL_ALIAS.to_string()
 }
 
+/// Returns the session directory when `path` is a unified-store journal
+/// segment: `<root>/unified/<session_id>/journal/<sequence>.jsonl`.
+pub(crate) fn unified_journal_session_dir(path: &Path) -> Option<&Path> {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+        return None;
+    }
+    let journal_dir = path.parent()?;
+    if journal_dir.file_name()? != "journal" {
+        return None;
+    }
+    let session_dir = journal_dir.parent()?;
+    if session_dir.parent()?.file_name()? != "unified" {
+        return None;
+    }
+    Some(session_dir)
+}
+
+fn non_negative(usage: &Value, key: &str) -> i64 {
+    usage.get(key).and_then(Value::as_i64).unwrap_or(0).max(0)
+}
+
+/// Split one unified-store `usage` record into additive buckets.
+///
+/// Every recorded call satisfies `total_tokens == input_tokens + output_tokens`,
+/// so `cached_input_tokens` and `cache_write_tokens` are subsets of
+/// `input_tokens` and `reasoning_tokens` is a subset of `output_tokens`. Vibe's
+/// own stats agree: it reports `session_prompt_tokens = input_tokens` and
+/// `session_cached_tokens = cached_input_tokens`. `TokenBreakdown` buckets are
+/// additive, so each subset is split out (and clamped, so a malformed row cannot
+/// drive a bucket negative) rather than counted on top.
+fn unified_usage_tokens(usage: &Value) -> TokenBreakdown {
+    let input = non_negative(usage, "input_tokens");
+    let output = non_negative(usage, "output_tokens");
+    let cache_read = non_negative(usage, "cached_input_tokens").min(input);
+    let cache_write = non_negative(usage, "cache_write_tokens").min(input - cache_read);
+    let reasoning = non_negative(usage, "reasoning_tokens").min(output);
+    TokenBreakdown {
+        input: input - cache_read - cache_write,
+        output: output - reasoning,
+        cache_read,
+        cache_write,
+        reasoning,
+        ..Default::default()
+    }
+}
+
+/// Parse one journal segment of a Vibe 3.x unified session.
+///
+/// Emits one message per recorded model call, keyed `vibe:<session>:<action>`
+/// so a call that appears in two segments is counted once. The journal carries
+/// no per-call timestamp or model, so those come from the sibling `meta.json`
+/// exactly as for the 2.x layout.
+///
+/// Scanning the segments (not `meta.json`) is deliberate: the journal is the
+/// file that grows with each call, so the per-file parse cache refreshes when
+/// usage changes.
+///
+/// When Vibe compacts a long session it drops the journal segments before the
+/// new snapshot, and neither the snapshots nor `meta.json` keep a cumulative
+/// token count, so calls made before a compaction cannot be recovered. For such
+/// a session the parsed usage is a lower bound.
+fn parse_unified_journal(path: &Path, session_dir: &Path) -> Vec<UnifiedMessage> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+
+    let meta = std::fs::read_to_string(session_dir.join("meta.json"))
+        .ok()
+        .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| Value::Object(Default::default()));
+
+    let session_id = meta
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or_else(|| {
+            session_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let timestamp = meta
+        .get("end_time")
+        .and_then(parse_timestamp_value)
+        .or_else(|| meta.get("start_time").and_then(parse_timestamp_value))
+        .filter(|&ts| ts > 0)
+        .unwrap_or_else(|| file_modified_timestamp_ms(path));
+
+    let model = resolve_model(&meta);
+    let inferred = provider_identity::inferred_provider_from_model(&model).unwrap_or("mistral");
+    let canonical_prov = provider_identity::canonical_provider(inferred);
+    let provider = canonical_prov.as_deref().unwrap_or(inferred);
+
+    let workspace_key = meta
+        .get("origin_directory")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            meta.pointer("/environment/working_directory")
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+        .and_then(normalize_workspace_key);
+    let workspace_label = workspace_key.as_deref().and_then(workspace_label_from_key);
+    let title = meta
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
+
+    let mut messages = Vec::new();
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        // Tool calls carry the whole model input; skip them unparsed. A live
+        // session may also end on a partially written line, which fails to
+        // parse below and is skipped.
+        if !line.contains("\"action_result\"") || !line.contains("\"usage\"") {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("action_result") {
+            continue;
+        }
+        let Some(payload) = record.get("payload") else {
+            continue;
+        };
+        let Some(result) = payload.get("result") else {
+            continue;
+        };
+        let is_completion = result
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.starts_with("completion_"));
+        if !is_completion {
+            continue;
+        }
+        let Some(usage) = result.pointer("/result/usage").filter(|u| u.is_object()) else {
+            continue;
+        };
+        let tokens = unified_usage_tokens(usage);
+        if tokens.total() == 0 {
+            continue;
+        }
+
+        let call_id = payload
+            .get("action_id")
+            .or_else(|| result.get("action_id"))
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or_else(|| {
+                record
+                    .get("sequence")
+                    .and_then(Value::as_i64)
+                    .map(|seq| format!("seq-{seq}"))
+            });
+        let Some(call_id) = call_id else {
+            continue;
+        };
+
+        let mut message = UnifiedMessage::new_with_dedup(
+            "vibe",
+            model.as_str(),
+            provider,
+            session_id.clone(),
+            timestamp,
+            tokens,
+            0.0,
+            Some(format!("vibe:{session_id}:{call_id}")),
+        );
+        if workspace_key.is_some() {
+            message.set_workspace(workspace_key.clone(), workspace_label.clone());
+        }
+        if let Some(title) = title {
+            message.session_title = Some(title.into());
+        }
+        messages.push(message);
+    }
+    messages
+}
+
 pub fn parse_vibe_file(path: &Path) -> Vec<UnifiedMessage> {
+    if let Some(session_dir) = unified_journal_session_dir(path) {
+        return parse_unified_journal(path, session_dir);
+    }
+
     let Ok(content) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
